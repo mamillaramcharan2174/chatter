@@ -1,0 +1,241 @@
+// ==============================================================================
+// X CHATTER - Prisma Database Schema
+// Database: PostgreSQL with Citext for usernames & UUIDs
+// ==============================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ------------------------------------------------------------------------------
+// 1. USER & AUTHENTICATION
+// ------------------------------------------------------------------------------
+enum UserStatus {
+  ONLINE
+  AWAY
+  OFFLINE
+}
+
+model User {
+  id              String       @id @default(uuid())
+  username        String       @unique
+  email           String?      @unique
+  phoneNumber     String?      @unique
+  passwordHash    String?
+  bio             String?      @default("Cyber vibes only. ⚡")
+  avatarUrl       String?
+  status          UserStatus   @default(OFFLINE)
+  lastSeenAt      DateTime     @default(now())
+
+  // Security & 2FA
+  twoFactorEnabled Boolean     @default(false)
+  twoFactorSecret  String?     // Encrypted TOTP secret
+
+  // Signal Protocol End-to-End Encryption Keys
+  identityKey     String?      // Public identity key
+  registrationId  Int?
+  signedPreKey    String?
+  signedPreKeySig String?
+  preKeys         PreKey[]
+
+  // Social & Friendships
+  friendshipsInitiated Friendship[] @relation("UserFriendships")
+  friendshipsReceived  Friendship[] @relation("FriendOfUser")
+
+  // Streaks
+  streaksAsUser1  Streak[]     @relation("StreakUser1")
+  streaksAsUser2  Streak[]     @relation("StreakUser2")
+
+  // Stories
+  stories         Story[]
+  storyViews      StoryView[]
+
+  // Messages sent & received
+  sentMessages     MessageEnvelope[] @relation("SentMessages")
+  receivedMessages MessageEnvelope[] @relation("ReceivedMessages")
+
+  // Refresh Tokens
+  refreshTokens    RefreshToken[]
+
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([username])
+  @@index([phoneNumber])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isRevoked Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Signal E2EE PreKey Bundle
+model PreKey {
+  id        Int      @id
+  keyId     Int
+  publicKey String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, keyId])
+}
+
+// ------------------------------------------------------------------------------
+// 2. SOCIAL GRAPH & FRIENDSHIPS
+// ------------------------------------------------------------------------------
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+  BLOCKED
+}
+
+model Friendship {
+  id          String           @id @default(uuid())
+  requesterId String
+  addresseeId String
+  status      FriendshipStatus @default(PENDING)
+
+  requester   User             @relation("UserFriendships", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee   User             @relation("FriendOfUser", fields: [addresseeId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([requesterId, addresseeId])
+}
+
+// ------------------------------------------------------------------------------
+// 3. STREAKS ENGINE (Daily Photo Sharing)
+// ------------------------------------------------------------------------------
+enum StreakState {
+  ACTIVE
+  EXPIRING_SOON // < 4 hours left
+  EXPIRED
+  FROZEN
+}
+
+model Streak {
+  id               String       @id @default(uuid())
+  user1Id          String
+  user2Id          String
+
+  currentStreak    Int          @default(0)
+  longestStreak    Int          @default(0)
+  state            StreakState  @default(ACTIVE)
+
+  // Last time user 1 sent their daily photo/snap
+  user1LastSnapAt  DateTime?
+  // Last time user 2 sent their daily photo/snap
+  user2LastSnapAt  DateTime?
+
+  // Current streak cycle deadline (must exchange snap within this window)
+  cycleExpiresAt   DateTime
+  lastIncrementedAt DateTime?
+
+  user1            User         @relation("StreakUser1", fields: [user1Id], references: [id], onDelete: Cascade)
+  user2            User         @relation("StreakUser2", fields: [user2Id], references: [id], onDelete: Cascade)
+
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@unique([user1Id, user2Id])
+  @@index([cycleExpiresAt, state])
+}
+
+// ------------------------------------------------------------------------------
+// 4. MESSAGING SYSTEM (End-to-End Encrypted)
+// User requirement: "no Auto-delete messages after viewing or after 24 hours"
+// Chat history is securely stored encrypted on server for delivery & sync.
+// ------------------------------------------------------------------------------
+enum MessageType {
+  TEXT
+  PHOTO
+  VIDEO
+  VOICE_NOTE
+  STICKER
+  GIF
+  STREAK_SNAP
+}
+
+model MessageEnvelope {
+  id             String      @id @default(uuid())
+  senderId       String
+  recipientId    String
+  
+  // Encrypted ciphertext payload (Double Ratchet session envelope)
+  encryptedPayload String    @db.Text
+  iv             String      // Initialization vector
+  keyId          Int?        // Optional key identifier for ratchet session
+
+  messageType    MessageType @default(TEXT)
+
+  // Ephemeral media URL (for photos/videos stored in S3)
+  mediaUrl       String?
+  mediaMimeType  String?
+
+  // Read receipts and delivery status
+  isDelivered    Boolean     @default(false)
+  deliveredAt    DateTime?
+  isRead         Boolean     @default(false)
+  readAt         DateTime?
+
+  sender         User        @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  recipient      User        @relation("ReceivedMessages", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  createdAt      DateTime    @default(now())
+
+  @@index([recipientId, isDelivered])
+  @@index([senderId, recipientId, createdAt])
+}
+
+// ------------------------------------------------------------------------------
+// 5. STORIES & STATUS (24-Hour Disappearing Stories)
+// ------------------------------------------------------------------------------
+enum StoryPrivacy {
+  EVERYONE
+  FRIENDS_ONLY
+  CUSTOM
+}
+
+model Story {
+  id           String        @id @default(uuid())
+  userId       String
+  mediaUrl     String        // Stored in S3 with 24h lifecycle rule
+  mediaType    String        // image/jpeg, video/mp4
+  caption      String?
+  filterName   String?
+  privacy      StoryPrivacy  @default(FRIENDS_ONLY)
+
+  expiresAt    DateTime      // Exact 24h expiration timestamp
+  createdAt    DateTime      @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  views        StoryView[]
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+}
+
+model StoryView {
+  id        String   @id @default(uuid())
+  storyId   String
+  viewerId  String
+  viewedAt  DateTime @default(now())
+
+  story     Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  viewer    User     @relation(fields: [viewerId], references: [id], onDelete: Cascade)
+
+  @@unique([storyId, viewerId])
+}
